@@ -44,9 +44,10 @@ public class CaseLoan {
 
 ```java
 public class ManagerLoan {
+    public Long managerId;
     public Integer caseCount;
-    
-    private void increaseCaseCount(Integer addend){
+
+    public void increaseCaseCount(Integer addend){
         this.caseCount = this.caseCount + addend;
     }
 }
@@ -83,27 +84,29 @@ public class CaseLoanRepositoryImpl implements CaseLoanRepository{
 如果后续想加入Redis作为持久化存储的一部分，只需在仓库加入RestTemplate、并且改动仓库的代码即可，对于业务层来说没有感知。但仅有仓库是不够的，上面说到 充血模型 和 表模型 的区别，我需要一个组件完成 充血模型 与 表模型 的转换，这个组件就是工厂（Builder）：
 
 ```JAVA
-public interface CaseLoanRepository{
+public interface CaseLoanRepository {
     CaseLoan query(Long caseId);
-    void save(CaseLoan caseLoan);
+    void update(CaseLoan caseLoan);
 }
 
-public class CaseLoanRepositoryImpl implements CaseLoanRepository{
+@Repository
+public class CaseLoanRepositoryImpl implements CaseLoanRepository {
+
     @Autowired
     private CaseEntityMapper caseEntityMapper;
     @Autowired
     private CaseLoanBuilder caseLoanBuilder;
-    
+
     @Override
-    public CaseLoan query(Long caseId){
+    public CaseLoan query(Long caseId) {
         CaseEntity caseEntity = caseEntityMapper.queryById(caseId);
-        CaseLoan caseLoan = caseLoanBuilder.toCaseBasic(caseEntity);
+        CaseLoan caseLoan = caseLoanBuilder.toCaseLoan(caseEntity);
         return caseLoan;
     }
-    
+
     @Override
-    public void update(CaseLoan CaseLoan){
-        CaseEntity caseEntity = caseLoanBuilder.toCaseEntity(CaseLoan);
+    public void update(CaseLoan caseLoan) {
+        CaseEntity caseEntity = caseLoanBuilder.toCaseEntity(caseLoan);
         caseEntityMapper.update(caseEntity);
     }
 }
@@ -111,11 +114,180 @@ public class CaseLoanRepositoryImpl implements CaseLoanRepository{
 
 整合到业务代码里是这样的：
 
+```java
+@Service
+public class CaseEntityServiceImpl implements CaseEntityService {
+    @Autowired
+    private CaseLoanRepository caseLoanRepository;
+    @Autowired
+    private ManagerLoanRepository managerLoanRepository;
+    @Autowired
+    private AuditLoanService auditLoanService;
+
+    @Override
+    public void submit(Long caseId) {
+        CaseLoan caseLoan = caseLoanRepository.query(caseId);
+        ManagerLoan managerLoan = managerLoanRepository.query(caseLoan.managerId);
+        // 包装请求，调用审批系统
+        SubmitCaseVo submitCaseVo = new SubmitCaseVo();
+        submitCaseVo.setCaseId(caseLoan.caseId);
+        String result = auditLoanService.submit(submitCaseVo);
+        if (!"000000".equals(result)) {
+            throw new RuntimeException("提交案件审批失败");
+        }
+        // 更改案件状态为2（审批中）
+        caseLoan.submitSuccess();
+        // 客户经理的案件个数+1
+        managerLoan.increaseCaseCount(1);
+        // 更新数据库
+        caseLoanRepository.update(caseLoan);
+        managerLoanRepository.update(managerLoan);
+    }
+}
+```
+
 # 防腐层
 
-我认为防腐层本质也是业务层，或者说业务层中调用外部接口的分支，它专门处理外部接口，通过封装外部接口的逻辑实现调用统一。但是，我认为它的核心思想是高内聚低耦合，并不是DDD的特点，即使在MVC架构中也会使用“防腐层”的设计降低外部接口与业务代码的耦合性。打个比方，在上面的调用审批系统代码中，可以将调用逻辑抽离出来：
+我认为防腐层本质也是应用层，或者说应用层中调用外部接口的分支，它专门处理外部接口，通过封装外部接口的逻辑实现调用统一。但是，我认为它的核心思想是高内聚低耦合，并不是DDD的特点，即使在MVC架构中也会使用“防腐层”的设计降低外部接口与业务代码的耦合性。打个比方，在上面的调用审批系统代码中，可以将调用逻辑抽离出来：
+
+```java
+@Service
+public class CaseEntityServiceImpl implements CaseEntityService {
+    @Autowired
+    private CaseLoanRepository caseLoanRepository;
+    @Autowired
+    private ManagerLoanRepository managerLoanRepository;
+    @Autowired
+    private AuditLoanService auditLoanService;
+
+    @Override
+    public void submit(Long caseId) {
+        CaseLoan caseLoan = caseLoanRepository.query(caseId);
+        ManagerLoan managerLoan = managerLoanRepository.query(caseLoan.managerId);
+        // 包装请求，调用审批系统
+        SubmitCaseVo submitCaseVo = new SubmitCaseVo();
+        submitCaseVo.setCaseId(caseLoan.caseId);
+        this.doSubmit(submitCaseVo);
+        // 更改案件状态为2（审批中）
+        caseLoan.submitSuccess();
+        // 客户经理的案件个数+1
+        managerLoan.increaseCaseCount(1);
+        // 更新数据库
+        caseLoanRepository.update(caseLoan);
+        managerLoanRepository.update(managerLoan);
+    }
+    
+    public void doSubmit(SubmitCaseVo submitCaseVo) {
+        String result = auditLoanService.submit(submitCaseVo);
+        if (!"000000".equals(result)) {
+            throw new RuntimeException("提交案件审批失败");
+        }
+    }
+}
+```
+
+或者单独抽离出一个Service，统一处理调用外部接口之后的逻辑：
+
+```java
+public class ThirdPartyServiceImpl implements ThirdPartyService {
+    
+    @Autowired
+    private AuditLoanService auditLoanService;
+
+    @Override
+    public void loanSubmit(SubmitCaseVo submitCaseVo) {
+        String result = auditLoanService.submit(submitCaseVo);
+        if (!"000000".equals(result)) {
+            throw new RuntimeException("提交案件审批失败");
+        }
+    }
+    
+}
+
+
+@Service
+public class CaseEntityServiceImpl implements CaseEntityService {
+    @Autowired
+    private CaseLoanRepository caseLoanRepository;
+    @Autowired
+    private ManagerLoanRepository managerLoanRepository;
+    @Autowired
+    private ThirdPartyService thirdPartyService;
+
+    @Override
+    public void submit(Long caseId) {
+        CaseLoan caseLoan = caseLoanRepository.query(caseId);
+        ManagerLoan managerLoan = managerLoanRepository.query(caseLoan.managerId);
+        // 包装请求，调用审批系统
+        SubmitCaseVo submitCaseVo = new SubmitCaseVo();
+        submitCaseVo.setCaseId(caseLoan.caseId);
+        thirdPartyService.loanSubmit(submitCaseVo);
+        // 更改案件状态为2（审批中）
+        caseLoan.submitSuccess();
+        // 客户经理的案件个数+1
+        managerLoan.increaseCaseCount(1);
+        // 更新数据库
+        caseLoanRepository.update(caseLoan);
+        managerLoanRepository.update(managerLoan);
+    }
+}
+```
 
 # 领域服务
 
-即DDD四层架构中的“业务层”，通过调用领域层的充血模型的业务API，组装出更丰富的业务。对于领域服务来说，最重要的作用是：调用领域层的业务方法，协调跨领域（充血）模型的数据交互。
+即DDD四层架构中的“领域层”，通过调用领域层的充血模型的业务API，组装出更丰富的业务。对于领域服务来说，最重要的作用是：调用不同领域的业务方法，协调跨领域（充血）模型的数据交互。如果拿DDD和MVC作比较，可以把MVC的Service层看作DDD的领域服务层，只不过MVC的Service操作 Entity 和 其他Service，**而DDD的领域服务操作各个 领域**：
 
+```java
+@Service
+public class CaseLoanSubmitServiceImpl implements CaseLoanSubmitService {
+
+    @Override
+    public void submitSuccess(CaseLoan caseLoan, ManagerLoan managerLoan) {
+        // 更改案件状态为2（审批中）
+        caseLoan.submitSuccess();
+        // 客户经理的案件个数+1
+        managerLoan.increaseCaseCount(1);
+    }
+
+}
+```
+
+# 最终效果
+
+```java
+/**
+ * 申请提交应用层
+ */
+@Service
+public class SubmitServiceImpl implements SubmitService {
+    @Autowired
+    private CaseLoanRepository caseLoanRepository;
+    @Autowired
+    private ManagerLoanRepository managerLoanRepository;
+    @Autowired
+    private ThirdPartyService thirdPartyService;
+    @Autowired
+    private CaseLoanSubmitService caseLoanSubmitService;
+
+    @Override
+    public void submit(Long caseId) {
+        CaseLoan caseLoan = caseLoanRepository.query(caseId);
+        ManagerLoan managerLoan = managerLoanRepository.query(caseLoan.managerId);
+        // 包装请求，调用审批系统
+        SubmitCaseVo submitCaseVo = new SubmitCaseVo();
+        submitCaseVo.setCaseId(caseLoan.caseId);
+        thirdPartyService.loanSubmit(submitCaseVo);
+        // 提交审批成功后的业务
+        caseLoanSubmitService.submitSuccess(caseLoan,managerLoan);
+        // 更新数据库
+        caseLoanRepository.update(caseLoan);
+        managerLoanRepository.update(managerLoan);
+    }
+}
+```
+
+# 上面例子中的分层
+
+结合前面讲到的DDD四层架构，我画一张图来解释上述例子中的分层：
+
+![02](02-MVC与DDD.assets/02.png)
